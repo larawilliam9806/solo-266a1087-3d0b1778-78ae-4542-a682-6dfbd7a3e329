@@ -7,15 +7,19 @@
 需要被测服务已在运行（UPLOAD_DIR 指向 <server_upload_dir>）。
 仅用标准库，可用 python3 -I 运行。
 """
+import base64
 import hashlib
 import http.cookiejar
 import json
 import os
+import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
 
 SLOW_SQL = (
     "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt "
@@ -45,6 +49,64 @@ def sha256(path):
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def make_variant_db(path, marker):
+    """基于演示库造一份内容不同的合法 SQLite 变体库（新增标记表）。"""
+    if os.path.exists(path):
+        os.remove(path)
+    conn = sqlite3.connect(path)
+    conn.execute("ATTACH DATABASE ? AS src", (demo_db_path,))
+    conn.execute("CREATE TABLE sensor_samples AS SELECT * FROM src.sensor_samples")
+    conn.execute("CREATE TABLE sensors AS SELECT * FROM src.sensors")
+    conn.execute("CREATE TABLE variant_marker (note TEXT)")
+    conn.execute("INSERT INTO variant_marker VALUES (?)", (marker,))
+    conn.commit()
+    conn.close()
+
+
+def make_corrupt_db(path):
+    """有效 SQLite 文件头但内容损坏，用于验证替换失败保留原副本。"""
+    raw = bytearray(open(demo_db_path, "rb").read())
+    for i in range(100, min(len(raw), 20000)):
+        raw[i] = (raw[i] + 13) & 0xFF
+    with open(path, "wb") as fh:
+        fh.write(raw)
+
+
+def list_replica_files(root):
+    out = []
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            if name.endswith(".db"):
+                out.append(os.path.join(dirpath, name))
+    return out
+
+
+demo_db_path = None
+
+
+def _b64url_decode(s):
+    s = s + "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s)
+
+
+def _uid_of(client):
+    """从 Flask 签名会话 cookie 中解出 uid（只解 payload，不依赖签名密钥）。"""
+    for handler in client.opener.handlers:
+        if isinstance(handler, urllib.request.HTTPCookieProcessor):
+            for ck in handler.cookiejar:
+                if ck.name != "session":
+                    continue
+                payload = ck.value.split(".")[0]
+                raw = _b64url_decode(payload)
+                if raw.startswith(b"."):  # Flask 压缩会话
+                    raw = zlib.decompress(raw[1:])
+                data = json.loads(raw)
+                uid = data.get("uid")
+                if uid and len(uid) == 32:
+                    return uid
+    return ""
 
 
 class Client:
@@ -117,6 +179,8 @@ class Client:
 
 def main():
     base, demo_db, upload_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+    global demo_db_path
+    demo_db_path = demo_db
     demo_hash = sha256(demo_db)
     c = Client(base)
 
@@ -246,10 +310,16 @@ def main():
           f"status={j.get('status')} wall={wall:.2f}s elapsed={j.get('elapsed_ms')}ms")
 
     print("== 数据库文件未被修改 ==")
-    uploaded = [os.path.join(upload_dir, f) for f in os.listdir(upload_dir) if f.endswith(".db")]
+    # 此刻本测试创建的会话都只上传过演示库（r1.db）；只校验这些副本，
+    # 后续竞态测试产生的变体副本（r2+）与历史轮次残留不纳入本检查
+    uploaded = [
+        p
+        for p in list_replica_files(upload_dir)
+        if os.path.basename(p) == "r1.db"
+    ]
     check("服务端存在上传副本", len(uploaded) >= 3, str(uploaded))
     for p in uploaded:
-        check(f"副本哈希未变 {os.path.basename(p)}", sha256(p) == demo_hash)
+        check(f"副本哈希未变 {os.path.relpath(p, upload_dir)}", sha256(p) == demo_hash)
 
     print("== 内置演示库入口 ==")
     c4 = Client(base)
@@ -257,6 +327,176 @@ def main():
     check("use-demo 可用", st == 200 and j.get("ok"), f"got {st} {j}")
     st, j = c4.call("GET", "/schema")
     check("演示库表结构可读", st == 200 and any(t["name"] == "sensor_samples" for t in j.get("tables", [])))
+
+    # ============================================================
+    # 副本切换与读取竞态专项（本次修复的核心回归测试）
+    # ============================================================
+    print("== 竞态①：慢查询在途时上传替换，旧查询读旧副本、新查询读新副本 ==")
+    rc = Client(base)
+    st, j = rc.call("POST", "/use-demo")
+    assert st == 200, j
+    v0 = j["version"]
+    st, r = rc.run_query(SLOW_SQL)
+    check("慢查询被受理（旧副本）", st == 200, f"got {st}")
+    time.sleep(0.6)  # 确保查询已在旧副本上跑起来
+
+    variant = os.path.join(tempfile.gettempdir(), "_variant_a_selftest.db")
+    make_variant_db(variant, "variant-A")
+    st, j = rc.upload(variant, "variant_a.db")
+    check("在途期间上传替换成功并产生新版本", st == 200 and j.get("version") == v0 + 1, f"got {st} {j}")
+    v1 = j.get("version")
+
+    st, cur = rc.call("GET", "/api/current")
+    check("当前指针已切到新副本", cur.get("version") == v1 and "variant_a" in cur.get("label", ""), str(cur))
+
+    st, nr = rc.run_query("SELECT note FROM variant_marker")
+    check("新请求使用切换后的副本（能查到新表）", st == 200, f"got {st}")
+    nj = rc.wait_final(nr["job_id"])
+    check("新副本查询成功且带新版本号",
+          nj["status"] == "done" and nj["rows"][0][0] == "variant-A" and nj["replica_version"] == v1, str(nj)[:200])
+
+    old_job = rc.wait_final(r["job_id"])
+    check("在途慢查询不受切换影响、自然超时且仍归属旧副本",
+          old_job["status"] == "timeout" and old_job["replica_version"] == v0, str(old_job)[:200])
+
+    replica_files = list_replica_files(upload_dir)
+    check("新旧两个副本文件都在盘（旧副本未被切换破坏/删除）",
+          any(f.endswith(f"r{v0}.db") for f in replica_files)
+          and any(f.endswith(f"r{v1}.db") for f in replica_files), str(replica_files))
+
+    print("== 竞态②：切换前受理的普通汇总查询绝不报数据库损坏 ==")
+    rc2 = Client(base)
+    st, j = rc2.call("POST", "/use-demo")
+    assert st == 200
+    base_v = j["version"]
+    st, r = rc2.run_query(DUP_SQL)
+    check("汇总查询被受理", st == 200)
+    time.sleep(0.2)
+    variant2 = os.path.join(tempfile.gettempdir(), "_variant_b_selftest.db")
+    make_variant_db(variant2, "variant-B")
+    st, _ = rc2.upload(variant2, "variant_b.db")
+    assert st == 200
+    dj = rc2.wait_final(r["job_id"])
+    check("切换未破坏已受理查询（无 malformed/disk image 错误，270 组重复）",
+          dj["status"] == "done" and dj["row_count"] == 270
+          and "malformed" not in (dj.get("error") or "") and dj["replica_version"] == base_v,
+          str(dj)[:200])
+
+    print("== 竞态③：表结构读取在途时切换，返回受理副本的结构且带版本号 ==")
+    rc3 = Client(base)
+    st, j = rc3.call("POST", "/use-demo")
+    assert st == 200
+    sv0 = j["version"]
+    barrier = threading.Event()
+
+    def slow_schema():
+        slow_schema.out = rc3.call("GET", "/schema")
+        barrier.set()
+
+    t = threading.Thread(target=slow_schema)
+    t.start()
+    time.sleep(0.15)
+    st, j = rc3.upload(variant, "variant_again.db")
+    assert st == 200
+    barrier.wait(timeout=10)
+    t.join(timeout=10)
+    st, sj = slow_schema.out
+    check("表结构读取成功且带副本版本/来源",
+          st == 200 and sj.get("replica_version") == sv0 and sj.get("replica_label"), str(sj)[:200])
+    check("表结构是受理时旧副本的（不含变体新表）",
+          all(tb["name"] != "variant_marker" for tb in sj.get("tables", [])), str([tb["name"] for tb in sj.get("tables", [])]))
+
+    print("== 竞态④：损坏/非法文件替换失败，原副本保留可用 ==")
+    rc4 = Client(base)
+    st, j = rc4.call("POST", "/use-demo")
+    assert st == 200
+    keep_v = j["version"]
+    st, j = rc4.upload(None, "evil.db", b"not a sqlite database at all........")
+    check("非 SQLite 文件被拒绝", st == 400, f"got {st} {j}")
+    corrupt = os.path.join(tempfile.gettempdir(), "_corrupt_selftest.db")
+    make_corrupt_db(corrupt)
+    st, j = rc4.upload(corrupt, "corrupt.db")
+    check("损坏 SQLite 被拒绝", st == 400 and ("完整性" in j.get("error", "") or "malformed" in j.get("error", "")),
+          f"got {st} {j}")
+    st, cur = rc4.call("GET", "/api/current")
+    check("替换失败后当前副本仍是原版本", cur.get("version") == keep_v, str(cur))
+    st, q = rc4.run_query("SELECT COUNT(*) AS n FROM sensor_samples")
+    qj = rc4.wait_final(q["job_id"])
+    check("原副本查询不受失败替换影响", qj["status"] == "done" and qj["rows"][0][0] == 13260, str(qj)[:200])
+    leftovers = [f for f in os.listdir(os.path.join(upload_dir, _uid_of(rc4))) if f.endswith(".part")] \
+        if os.path.isdir(os.path.join(upload_dir, _uid_of(rc4))) else []
+    check("失败替换不残留临时文件", not leftovers, str(leftovers))
+
+    print("== 竞态⑤：清除副本不影响在途查询，结束后退役副本被回收 ==")
+    rc5 = Client(base)
+    st, j = rc5.call("POST", "/use-demo")
+    assert st == 200
+    rv = j["version"]
+    sdir_before = os.path.join(upload_dir, _uid_of(rc5))
+    st, r = rc5.run_query(SLOW_SQL)
+    check("慢查询受理后清除副本", st == 200)
+    time.sleep(0.5)
+    st, j = rc5.call("POST", "/reset")
+    check("reset 成功", st == 200 and j.get("ok"), f"got {st} {j}")
+    st, _ = rc5.call("GET", "/api/current")
+    check("清除后无当前副本", st == 200 and _.get("loaded") is False, str(_))
+    files_during = list_replica_files(sdir_before) if os.path.isdir(sdir_before) else []
+    check("在途期间退役副本文件仍保留（避开在途读取）",
+          any(f.endswith(f"r{rv}.db") for f in files_during), str(files_during))
+    rj = rc5.wait_final(r["job_id"])
+    check("被清除副本上的在途查询仍正常落定（超时，归属旧版本）",
+          rj["status"] == "timeout" and rj["replica_version"] == rv, str(rj)[:200])
+    time.sleep(0.5)
+    check("在途读取结束后退役副本被回收",
+          not any(f.endswith(f"r{rv}.db") for f in list_replica_files(sdir_before)),
+          str(list_replica_files(sdir_before)))
+
+    print("== 竞态⑥：use-demo 切换同样走原子发布，不破坏在途查询 ==")
+    rc6 = Client(base)
+    st, j = rc6.upload(variant, "variant_for_demo.db")
+    assert st == 200
+    dv0 = j["version"]
+    st, r = rc6.run_query(SLOW_SQL)
+    check("变体库上的慢查询被受理", st == 200)
+    time.sleep(0.5)
+    st, j = rc6.call("POST", "/use-demo")
+    check("在途期间切换到演示库成功", st == 200 and j.get("version") == dv0 + 1, f"got {st} {j}")
+    rj = rc6.wait_final(r["job_id"])
+    check("旧副本慢查询未被 use-demo 破坏", rj["status"] == "timeout" and rj["replica_version"] == dv0, str(rj)[:200])
+    st, q = rc6.run_query("SELECT COUNT(*) AS n FROM sensor_samples")
+    qj = rc6.wait_final(q["job_id"])
+    check("切换后新查询落在演示库副本", qj["status"] == "done" and qj["replica_version"] == dv0 + 1, str(qj)[:200])
+
+    print("== 竞态⑦：只读保护 / 名额 / 取消 / 超时行为保持不变 ==")
+    rc7 = Client(base)
+    st, _ = rc7.call("POST", "/use-demo")
+    assert st == 200
+    st, j = rc7.run_query("DELETE FROM sensor_samples")
+    check("切换后写语句仍被 400 拒绝", st == 400, f"got {st}")
+    ca, cb = Client(base), Client(base)
+    ca.call("POST", "/use-demo")
+    cb.call("POST", "/use-demo")
+    s1, r1 = ca.run_query(SLOW_SQL)
+    s2, r2 = cb.run_query(SLOW_SQL)
+    check("名额语义不变：两条受理", s1 == 200 and s2 == 200, f"{s1} {s2}")
+    time.sleep(0.5)
+    s3, r3 = rc7.run_query("SELECT 1")
+    check("名额语义不变：满额 429", s3 == 429 and "满" in r3.get("error", ""), f"got {s3}")
+    st, j = ca.call("POST", f"/query/{r1['job_id']}/cancel")
+    check("取消语义不变：cancelled 且计算停止", j.get("status") == "cancelled", str(j)[:150])
+    cb.wait_final(r2["job_id"])
+    managed = [p for p in list_replica_files(upload_dir)
+               if os.path.basename(p).startswith("r") and p.endswith(".db")]
+    for p in managed:
+        try:
+            conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+            conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+            conn.close()
+        except sqlite3.Error as exc:
+            check(f"所有留存副本均为完好 SQLite：{os.path.relpath(p, upload_dir)}", False, str(exc))
+            break
+    else:
+        check("所有留存副本均为完好 SQLite", bool(managed))
 
     print()
     print(f"共 {checks[0]} 项检查，失败 {len(failures)} 项")

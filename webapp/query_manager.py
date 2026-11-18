@@ -61,11 +61,16 @@ def _json_safe(value):
 
 
 class Job:
-    """一条查询的生命周期：queued -> running -> done/error/timeout/cancelled"""
+    """一条查询的生命周期：queued -> running -> done/error/timeout/cancelled
 
-    def __init__(self, db_path, sql):
+    db_replica 是受理时获取的不可变副本句柄（已 pin），查询全程读取该副本；
+    worker 退出时在 finally 中 release，切换/清除/清理都不会动这份文件。
+    """
+
+    def __init__(self, db_replica, sql):
         self.id = uuid.uuid4().hex
-        self.db_path = db_path
+        self.replica = db_replica
+        self.db_path = db_replica.path  # 保留字段名，连接打开逻辑不变
         self.sql = sql
         self.status = "queued"
         self.columns = None
@@ -106,6 +111,9 @@ class Job:
                 "truncated": self.truncated,
                 "error": self.error,
                 "elapsed_ms": int((end - self.started_at) * 1000) if self.started_at else 0,
+                # 结果来源：受理时锁定的副本版本；前端据此识别迟到的旧副本响应
+                "replica_version": self.replica.version,
+                "replica_label": self.replica.label,
             }
             if self.status == "done":
                 data["columns"] = self.columns
@@ -126,13 +134,18 @@ class QueryManager:
 
     # ---------------- 对外接口 ----------------
 
-    def submit(self, db_path, sql):
-        """提交查询；名额已满时返回 None（不排队，由上层明确拒绝）。"""
+    def submit(self, db_replica, sql):
+        """提交查询；名额已满时返回 None（不排队，由上层明确拒绝）。
+
+        db_replica 必须是调用方通过 ReplicaRegistry.acquire() 取得的已 pin 副本句柄。
+        名额已满或建线程失败时由本方法负责释放该句柄，避免 pin 泄漏。
+        """
         if not self._slots.acquire(blocking=False):
+            db_replica.release()
             return None
         try:
             self._prune()
-            job = Job(db_path, sql)
+            job = Job(db_replica, sql)
             with self._lock:
                 self._jobs[job.id] = job
             t = threading.Thread(
@@ -143,6 +156,7 @@ class QueryManager:
             return job
         except Exception:
             self._slots.release()
+            db_replica.release()
             raise
 
     def get(self, job_id):
@@ -224,6 +238,8 @@ class QueryManager:
                 except Exception:
                     pass
             self._slots.release()
+            # 连接已关闭，释放受理时持有的副本句柄：退役副本若再无在途读取即在此回收
+            job.replica.release()
             status, payload = outcome
             with job.lock:
                 job.status = status

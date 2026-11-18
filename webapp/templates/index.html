@@ -44,6 +44,12 @@
   table.cols { border-collapse:collapse; font-size:12px; width:100%; }
   table.cols th, table.cols td { border-bottom:1px solid var(--line); padding:3px 8px; text-align:left; }
   .pill { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; border:1px solid var(--line); color:var(--dim); }
+  .src { font-size:12px; color:#9fc3e0; }
+  .src.old { color:var(--warn); }
+  .stale-item { border:1px solid var(--warn); border-radius:8px; padding:10px 12px; margin:10px 0; }
+  .stale-item h3 { margin:0 0 6px; font-size:13px; color:var(--warn); font-weight:600; }
+  .stale-item pre { margin:6px 0; white-space:pre-wrap; word-break:break-all;
+                    font:12px/1.5 "SF Mono",Consolas,monospace; color:var(--dim); }
   .examples button { font-size:12px; padding:4px 10px; }
   #dropHint { border:1px dashed var(--line); border-radius:8px; padding:10px 14px; color:var(--dim); }
   code { background:#0d1620; padding:1px 5px; border-radius:4px; font-size:12px; }
@@ -69,6 +75,7 @@
 
   <section class="card" id="schemaCard" style="display:none">
     <h2>② 表结构 <button id="schemaBtn" style="float:right;font-size:12px">刷新</button></h2>
+    <div id="schemaSrc" class="src" style="margin-bottom:8px"></div>
     <div id="schemaBox"><span class="muted">加载中…</span></div>
   </section>
 
@@ -88,7 +95,16 @@
       <span id="qStatus" class="muted"></span>
     </div>
     <div id="banner" class="banner"></div>
+    <div id="resultSrc" class="src" style="display:none"></div>
     <div id="resultBox"></div>
+  </section>
+
+  <section class="card" id="staleCard" style="display:none">
+    <h2>④ 旧副本的迟到响应</h2>
+    <div class="muted" style="margin-bottom:6px">
+      以下结果来自已被替换 / 清除的旧副本，仅作存档，<b>不会覆盖</b>上方当前副本的展示。
+    </div>
+    <div id="staleBox"></div>
   </section>
 </main>
 
@@ -129,6 +145,58 @@ SELECT COUNT(*) AS n, SUM(x) AS total FROM cnt;`
 
 const $ = id => document.getElementById(id);
 let currentJob = null, pollTimer = null;
+let currentVersion = null;   // 当前副本版本：切换/清除后变化，用于识别旧副本迟到响应
+let currentLabel = null;
+
+function sourceText(v, label) {
+  return `来源：副本 v${v} · ${label ?? '未知来源'}`;
+}
+
+function showStaleCard() { $('staleCard').style.display = ''; }
+
+function addStale(j, note) {
+  showStaleCard();
+  const item = document.createElement('div');
+  item.className = 'stale-item';
+  const h = document.createElement('h3');
+  h.textContent = note + ' — ' + sourceText(j.replica_version, j.replica_label);
+  item.append(h);
+  const pre = document.createElement('pre');
+  pre.textContent = j.sql;
+  item.append(pre);
+  const p = document.createElement('p');
+  p.className = 'muted';
+  p.style.margin = '4px 0';
+  if (j.status === 'done') {
+    p.textContent = `完成：${j.row_count} 行${j.truncated ? '（已截断）' : ''}，用时 ${(j.elapsed_ms/1000).toFixed(2)}s`;
+  } else if (j.status === 'timeout') {
+    p.textContent = `超时终止（${(j.elapsed_ms/1000).toFixed(2)}s）`;
+  } else if (j.status === 'cancelled') {
+    p.textContent = `已取消（${(j.elapsed_ms/1000).toFixed(2)}s）`;
+  } else {
+    p.textContent = `失败：${j.error || '未知错误'}`;
+  }
+  item.append(p);
+  if (j.status === 'done' && j.rows && j.rows.length) {
+    const wrap = document.createElement('div'); wrap.className = 'tblwrap';
+    const t = document.createElement('table'); t.className = 'result';
+    const hr = document.createElement('tr');
+    for (const c of j.columns) { const th = document.createElement('th'); th.textContent = c; hr.append(th); }
+    t.append(hr);
+    for (const row of j.rows.slice(0, 50)) {
+      const r = document.createElement('tr');
+      for (const v of row) { const td = document.createElement('td'); td.textContent = v === null ? 'NULL' : String(v); r.append(td); }
+      t.append(r);
+    }
+    wrap.append(t);
+    if (j.rows.length > 50) {
+      const more = el('p', 'muted', `仅预览前 50 行（共 ${j.rows.length} 行）`);
+      item.append(more);
+    }
+    item.append(wrap);
+  }
+  $('staleBox').prepend(item);
+}
 
 async function api(method, url, body) {
   const opt = { method, headers: {} };
@@ -144,11 +212,20 @@ function setDbStatus(msg) { $('dbStatus').textContent = msg; }
 async function refreshCurrent() {
   const { body } = await api('GET', '/api/current');
   if (body.loaded) {
-    setDbStatus(`已加载副本（${(body.size/1024).toFixed(1)} KB）。所有查询均为只读，不影响原库。`);
+    const switched = currentVersion !== null && currentVersion !== body.version;
+    currentVersion = body.version;
+    currentLabel = body.label;
+    setDbStatus(`已加载副本 v${body.version}（${(body.size/1024).toFixed(1)} KB）：${body.label}。所有查询均为只读，不影响原库。`);
     $('schemaCard').style.display = '';
     $('queryCard').style.display = '';
+    if (switched) { banner('run', `副本已切换到 v${body.version}，新查询将使用该副本；旧查询的迟到结果会进入下方存档区。`); }
     loadSchema();
   } else {
+    if (currentVersion !== null) {
+      banner('warn', '当前副本已清除；进行中查询的迟到结果将进入下方存档区。');
+    }
+    currentVersion = null;
+    currentLabel = null;
     setDbStatus('尚未加载数据库。');
     $('schemaCard').style.display = 'none';
     $('queryCard').style.display = 'none';
@@ -175,15 +252,31 @@ $('demoBtn').onclick = async () => {
 
 $('resetBtn').onclick = async () => {
   await api('POST', '/reset');
+  currentVersion = null;
+  currentLabel = null;
   setDbStatus('副本已清除。');
   $('schemaCard').style.display = 'none';
   $('queryCard').style.display = 'none';
+  $('resultSrc').style.display = 'none';
+  $('resultBox').innerHTML = '';
+  clearBanner();
 };
 
 async function loadSchema() {
   const box = $('schemaBox');
   const { status, body } = await api('GET', '/schema');
-  if (status !== 200) { box.innerHTML = ''; box.append(el('span','muted', body.error || '加载失败')); return; }
+  if (status !== 200) {
+    box.innerHTML = '';
+    $('schemaSrc').textContent = '';
+    box.append(el('span','muted', body.error || '加载失败'));
+    return;
+  }
+  // 表结构同样有副本版本：切换后到达的旧响应不覆盖当前展示
+  if (currentVersion !== null && body.replica_version !== currentVersion) {
+    addStaleSchema(body);
+    return;
+  }
+  $('schemaSrc').textContent = sourceText(body.replica_version, body.replica_label);
   box.innerHTML = '';
   for (const t of body.tables) {
     const d = document.createElement('details');
@@ -214,6 +307,18 @@ $('schemaBtn').onclick = loadSchema;
 
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
 
+function addStaleSchema(body) {
+  showStaleCard();
+  const item = document.createElement('div');
+  item.className = 'stale-item';
+  const h = document.createElement('h3');
+  h.textContent = '旧副本表结构（已被切换，未覆盖当前展示） — ' + sourceText(body.replica_version, body.replica_label);
+  item.append(h);
+  const p = el('p', 'muted', '包含表：' + body.tables.map(t => t.name).join('、'));
+  item.append(p);
+  $('staleBox').prepend(item);
+}
+
 document.querySelectorAll('.examples button').forEach(b => {
   b.onclick = () => { $('sql').value = EXAMPLES[b.dataset.ex]; };
 });
@@ -230,6 +335,7 @@ $('runBtn').onclick = async () => {
   if (!sql) { banner('err', 'SQL 不能为空'); return; }
   clearBanner();
   $('resultBox').innerHTML = '';
+  $('resultSrc').style.display = 'none';
   const { status, body } = await api('POST', '/query', { sql });
   if (status === 429) { banner('warn', body.error); return; }
   if (status !== 200) { banner('err', body.error || ('请求失败 ' + status)); return; }
@@ -268,9 +374,18 @@ function finish() {
 }
 
 function renderFinal(j) {
+  // 旧副本的迟到响应（含切换 / 清除后才落定的查询）：进入存档区，绝不覆盖当前展示
+  if (currentVersion === null || j.replica_version !== currentVersion) {
+    const note = currentVersion === null ? '副本已清除后到达的查询结果' : '旧副本切换前受理的查询结果';
+    addStale(j, note);
+    finish();
+    return;
+  }
   finish();
   const box = $('resultBox');
   box.innerHTML = '';
+  $('resultSrc').style.display = '';
+  $('resultSrc').textContent = sourceText(j.replica_version, j.replica_label);
   const secs = (j.elapsed_ms/1000).toFixed(2);
   if (j.status === 'done') {
     $('qStatus').textContent = `完成，用时 ${secs}s`;

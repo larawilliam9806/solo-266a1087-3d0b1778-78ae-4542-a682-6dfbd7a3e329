@@ -11,6 +11,7 @@ services:
       MAX_CONCURRENT: "2"     # 最大并发查询数，满额返回 429
       MAX_ROWS: "1000"        # 单次最多返回行数
       MAX_UPLOAD_MB: "300"    # 上传文件大小上限
+      UPLOAD_TTL_HOURS: "24"  # 退役历史副本的保留时长；当前副本与在途副本不受 TTL 限制
     volumes:
       - uploads:/data/uploads
     restart: unless-stopped
